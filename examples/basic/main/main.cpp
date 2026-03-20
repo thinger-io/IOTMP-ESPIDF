@@ -120,7 +120,7 @@ extern "C" void app_main(void) {
     // Optional: state callback
     thing.set_state_callback([](thinger::iotmp::client_state state) {
         switch(state) {
-            case thinger::iotmp::client_state::CONNECTING:
+            case thinger::iotmp::client_state::SOCKET_CONNECTING:
                 ESP_LOGI("app", "State: CONNECTING");
                 break;
             case thinger::iotmp::client_state::AUTHENTICATED:

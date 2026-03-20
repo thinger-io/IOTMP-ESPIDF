@@ -128,7 +128,7 @@ unsigned long client::get_millis() const {
 
 void client::on_disconnect() {
     connected_ = false;
-    notify_state(client_state::DISCONNECTED);
+    set_state(client_state::DISCONNECTED);
     do_disconnect();
     clear_streams();
 }
@@ -202,29 +202,29 @@ void client::run() {
 
     while(running_) {
         // Connect
-        notify_state(client_state::CONNECTING);
+        set_state(client_state::SOCKET_CONNECTING);
         int rc = do_connect();
         if(rc < 0) {
             ESP_LOGE(TAG, "Connection failed: %d", rc);
-            notify_state(client_state::CONNECTION_ERROR);
+            set_state(client_state::SOCKET_CONNECTION_ERROR);
             goto reconnect;
         }
-        notify_state(client_state::CONNECTED);
+        set_state(client_state::SOCKET_CONNECTED);
 
         // Authenticate (using base class)
-        notify_state(client_state::AUTHENTICATING);
+        set_state(client_state::AUTHENTICATING);
         if(!this->authenticate()) {
             ESP_LOGE(TAG, "Authentication failed");
-            notify_state(client_state::AUTH_FAILED);
+            set_state(client_state::AUTH_FAILED);
             do_disconnect();
             goto reconnect;
         }
 
         ESP_LOGI(TAG, "Authenticated as %s@%s", get_device_id(), get_username());
         connected_ = true;
-        notify_state(client_state::AUTHENTICATED);
+        set_state(client_state::AUTHENTICATED);
         backoff_ms = CONFIG_THINGER_IOTMP_RECONNECT_BASE_MS;
-        notify_state(client_state::READY);
+        set_state(client_state::READY);
 
         // Event loop
         {
@@ -317,7 +317,7 @@ void client::run() {
         }
 
         connected_ = false;
-        notify_state(client_state::DISCONNECTED);
+        set_state(client_state::DISCONNECTED);
         do_disconnect();
         this->clear_streams();
 
@@ -526,11 +526,9 @@ bool client::call_endpoint(const char* endpoint_name, json_t data) {
 // Helpers
 // ============================================================================
 
-void client::notify_state(client_state state) {
+void client::set_state(client_state state) {
     state_ = state;
-    if(state_callback_) {
-        state_callback_(state);
-    }
+    notify_state(state);
 }
 
 } // namespace thinger::iotmp
