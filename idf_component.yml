@@ -1,0 +1,7 @@
+version: "1.0.0"
+description: "IOTMP client for ESP-IDF — connects to Thinger.io IoT platform"
+url: "https://github.com/thinger-io/IOTMP-ESPIDF"
+repository: "https://github.com/thinger-io/IOTMP-ESPIDF.git"
+dependencies:
+  idf: ">=5.0"
+  # Compatible with IDF 5.x and 6.x

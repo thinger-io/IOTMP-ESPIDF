@@ -1,0 +1,34 @@
+menu "Thinger IOTMP Client"
+
+    config THINGER_IOTMP_STACK_SIZE
+        int "Client task stack size"
+        default 8192
+
+    config THINGER_IOTMP_PRIORITY
+        int "Client task priority"
+        default 5
+
+    config THINGER_IOTMP_KEEPALIVE_SECONDS
+        int "Keep-alive interval (seconds)"
+        default 60
+
+    config THINGER_IOTMP_MAX_MESSAGE_SIZE
+        int "Maximum message size (bytes)"
+        default 4096
+
+    config THINGER_IOTMP_TLS
+        bool "Enable TLS"
+        default y
+        help
+            Enable TLS for secure connections (port 25206).
+            Disable for plain TCP (port 25204).
+
+    config THINGER_IOTMP_RECONNECT_BASE_MS
+        int "Reconnection base delay (ms)"
+        default 1000
+
+    config THINGER_IOTMP_RECONNECT_MAX_MS
+        int "Reconnection max delay (ms)"
+        default 60000
+
+endmenu

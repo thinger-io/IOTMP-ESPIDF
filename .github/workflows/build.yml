@@ -1,0 +1,46 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v6.0
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [esp32, esp32s3, esp32c3]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: iotmp-espidf
+
+      - uses: actions/checkout@v6
+        with:
+          repository: thinger-io/IOTMP-Embedded
+          path: iotmp-embedded
+
+      - name: Prepare iotmp-embedded as ESP-IDF component
+        run: |
+          cat > iotmp-embedded/CMakeLists.txt << 'EOF'
+          idf_component_register(INCLUDE_DIRS "include")
+          EOF
+
+      - name: Build (${{ matrix.target }})
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          cd iotmp-espidf/examples/basic
+          idf.py set-target ${{ matrix.target }}
+          idf.py build -DEXTRA_COMPONENT_DIRS="$GITHUB_WORKSPACE/iotmp-espidf;$GITHUB_WORKSPACE/iotmp-embedded"
+
+      - name: Memory usage
+        if: success()
+        run: |
+          size iotmp-espidf/examples/basic/build/*.elf 2>/dev/null || true
