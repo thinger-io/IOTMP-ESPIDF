@@ -69,7 +69,6 @@
 #endif
 
 #include <string>
-#include <map>
 #include <queue>
 #include <functional>
 
@@ -86,23 +85,10 @@ namespace thinger::iotmp {
         READY
     };
 
-    struct stream_config {
-        iotmp_resource* resource = nullptr;
-        unsigned int interval_ms = 0;
-        int64_t last_streaming = 0;
-    };
-
-    class client {
+    class client : public iotmp_client_base<client> {
     public:
         client();
         ~client();
-
-        // Configuration
-        void set_credentials(const char* username, const char* device_id, const char* credentials);
-        void set_host(const char* host, uint16_t port = 0);
-
-        // Resource registration
-        iotmp_resource& operator[](const char* name);
 
         // Lifecycle
         esp_err_t start();
@@ -123,8 +109,16 @@ namespace thinger::iotmp {
         bool call_endpoint(const char* endpoint_name);
         bool call_endpoint(const char* endpoint_name, json_t data);
 
-        // Manually stream a resource's current value
-        bool stream(const char* resource_name);
+        // ----- CRTP transport implementation -------------------------
+
+        bool send_bytes_impl(const void* data, size_t len);
+        bool recv_bytes_impl(void* buf, size_t len);
+        bool is_connected_impl() const;
+        unsigned long get_millis() const;
+        void on_disconnect();
+
+        // Send message from any task (queues + wakes select)
+        bool enqueue_message(iotmp_message& msg);
 
     private:
         // Task entry point
@@ -136,49 +130,15 @@ namespace thinger::iotmp {
         // Connection lifecycle
         int do_connect();
         void do_disconnect();
-        bool do_authenticate();
 
-        // I/O helpers
-        bool socket_read(void* buf, size_t len);
-        bool socket_write(const void* buf, size_t len);
-        bool read_varint(uint32_t& value);
-
-        // Message handling
-        bool read_message(iotmp_message& msg);
-        bool write_message(iotmp_message& msg);
-        void handle_message(iotmp_message& msg);
-        void handle_resource_request(iotmp_message& request);
-
-        // Send message from client task (direct write)
-        void send_message(iotmp_message& msg);
-
-        // Send message from any task (queues + wakes select)
-        bool enqueue_message(iotmp_message& msg);
+        // Flush TX queue (called from client task)
         void flush_tx_queue();
-
-        // Streaming helpers
-        bool stream_resource(iotmp_resource& resource, uint16_t stream_id);
-        void check_stream_intervals();
 
         // Server API helper (sends RUN message and waits for response)
         bool server_request(iotmp_message& msg, json_t* response_payload = nullptr);
 
         // State
         void notify_state(client_state state);
-
-        // Resource matching
-        iotmp_resource* find_resource(const std::string& path);
-
-        // Configuration
-        std::string host_ = "iot.thinger.io";
-#ifdef CONFIG_THINGER_IOTMP_TLS
-        uint16_t port_ = 25206;
-#else
-        uint16_t port_ = 25204;
-#endif
-        std::string username_;
-        std::string device_id_;
-        std::string credentials_;
 
         // Socket (plain TCP)
         int sock_ = -1;
@@ -198,10 +158,6 @@ namespace thinger::iotmp {
         // TX queue (for cross-task message sending)
         SemaphoreHandle_t tx_mutex_ = nullptr;
         std::queue<std::string> tx_queue_;
-
-        // Resources and streams
-        std::map<std::string, iotmp_resource> resources_;
-        std::map<uint16_t, stream_config> streams_;
 
         // Read buffer
         uint8_t read_buffer_[CONFIG_THINGER_IOTMP_MAX_MESSAGE_SIZE];

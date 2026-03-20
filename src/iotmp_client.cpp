@@ -39,19 +39,17 @@ static const char* TAG = "iotmp";
 namespace thinger::iotmp {
 
 // ============================================================================
-// Helper: monotonic uptime in milliseconds
-// ============================================================================
-
-static inline int64_t uptime_ms() {
-    return esp_timer_get_time() / 1000;
-}
-
-// ============================================================================
 // Construction / Configuration
 // ============================================================================
 
 client::client() {
     tx_mutex_ = xSemaphoreCreateMutex();
+    // Default port depends on TLS config
+#ifdef CONFIG_THINGER_IOTMP_TLS
+    port_ = 25206;
+#else
+    port_ = 25204;
+#endif
 }
 
 client::~client() {
@@ -62,21 +60,77 @@ client::~client() {
     }
 }
 
-void client::set_credentials(const char* username, const char* device_id, const char* credentials) {
-    username_ = username;
-    device_id_ = device_id;
-    credentials_ = credentials;
-}
+// ============================================================================
+// CRTP transport implementation
+// ============================================================================
 
-void client::set_host(const char* host, uint16_t port) {
-    host_ = host;
-    if(port != 0) {
-        port_ = port;
+bool client::send_bytes_impl(const void* buf, size_t len) {
+    auto* ptr = static_cast<const uint8_t*>(buf);
+    size_t remaining = len;
+
+    while(remaining > 0) {
+#ifdef CONFIG_THINGER_IOTMP_TLS
+        if(!tls_) return false;
+        ssize_t rc = esp_tls_conn_write(tls_, ptr, remaining);
+        if(rc < 0) {
+            if(rc == ESP_TLS_ERR_SSL_WANT_READ || rc == ESP_TLS_ERR_SSL_WANT_WRITE) {
+                continue; // Retry on TLS want read/write
+            }
+            return false;
+        }
+        if(rc == 0) return false;
+#else
+        ssize_t rc = send(sock_, ptr, remaining, 0);
+        if(rc <= 0) return false;
+#endif
+        ptr += rc;
+        remaining -= rc;
     }
+    return true;
 }
 
-iotmp_resource& client::operator[](const char* name) {
-    return resources_[std::string(name)];
+bool client::recv_bytes_impl(void* buf, size_t len) {
+    auto* ptr = static_cast<uint8_t*>(buf);
+    size_t remaining = len;
+
+    while(remaining > 0) {
+#ifdef CONFIG_THINGER_IOTMP_TLS
+        if(!tls_) return false;
+        ssize_t rc = esp_tls_conn_read(tls_, ptr, remaining);
+        if(rc < 0) {
+            if(rc == ESP_TLS_ERR_SSL_WANT_READ || rc == ESP_TLS_ERR_SSL_WANT_WRITE) {
+                continue; // Retry on TLS want read/write
+            }
+            return false;
+        }
+        if(rc == 0) return false; // Connection closed
+#else
+        ssize_t rc = recv(sock_, ptr, remaining, 0);
+        if(rc <= 0) return false;
+#endif
+        ptr += rc;
+        remaining -= rc;
+    }
+    return true;
+}
+
+bool client::is_connected_impl() const {
+#ifdef CONFIG_THINGER_IOTMP_TLS
+    return tls_ != nullptr && connected_;
+#else
+    return sock_ >= 0 && connected_;
+#endif
+}
+
+unsigned long client::get_millis() const {
+    return static_cast<unsigned long>(esp_timer_get_time() / 1000);
+}
+
+void client::on_disconnect() {
+    connected_ = false;
+    notify_state(client_state::DISCONNECTED);
+    do_disconnect();
+    clear_streams();
 }
 
 // ============================================================================
@@ -157,16 +211,16 @@ void client::run() {
         }
         notify_state(client_state::CONNECTED);
 
-        // Authenticate
+        // Authenticate (using base class)
         notify_state(client_state::AUTHENTICATING);
-        if(!do_authenticate()) {
+        if(!this->authenticate()) {
             ESP_LOGE(TAG, "Authentication failed");
             notify_state(client_state::AUTH_FAILED);
             do_disconnect();
             goto reconnect;
         }
 
-        ESP_LOGI(TAG, "Authenticated as %s@%s", device_id_.c_str(), username_.c_str());
+        ESP_LOGI(TAG, "Authenticated as %s@%s", get_device_id(), get_username());
         connected_ = true;
         notify_state(client_state::AUTHENTICATED);
         backoff_ms = CONFIG_THINGER_IOTMP_RECONNECT_BASE_MS;
@@ -174,10 +228,10 @@ void client::run() {
 
         // Event loop
         {
-            int64_t last_activity = uptime_ms();
+            int64_t last_activity = get_millis();
 
             while(running_ && connected_) {
-                int64_t elapsed = uptime_ms() - last_activity;
+                int64_t elapsed = get_millis() - last_activity;
                 int keepalive_ms = CONFIG_THINGER_IOTMP_KEEPALIVE_SECONDS * 1000;
                 int timeout_ms = std::max(0, static_cast<int>(keepalive_ms - elapsed));
 
@@ -237,9 +291,9 @@ void client::run() {
 
                 if(socket_readable) {
                     iotmp_message msg(message::type::RESERVED);
-                    if(read_message(msg)) {
-                        handle_message(msg);
-                        last_activity = uptime_ms();
+                    if(this->read_message(msg)) {
+                        this->handle_message(msg);
+                        last_activity = get_millis();
                     } else {
                         ESP_LOGW(TAG, "Failed to read message, disconnecting");
                         break;
@@ -251,23 +305,21 @@ void client::run() {
                 flush_tx_queue();
 
                 // Keepalive timeout
-                elapsed = uptime_ms() - last_activity;
+                elapsed = get_millis() - last_activity;
                 if(elapsed >= keepalive_ms) {
-                    auto ka = encode_message(message::type::KEEP_ALIVE);
-                    socket_write(ka.data(), ka.size());
-                    last_activity = uptime_ms();
-                    ESP_LOGD(TAG, "Keep-alive sent");
+                    this->send_keepalive();
+                    last_activity = get_millis();
                 }
 
-                // Check stream intervals
-                check_stream_intervals();
+                // Check stream intervals (using base class)
+                this->check_streams();
             }
         }
 
         connected_ = false;
         notify_state(client_state::DISCONNECTED);
         do_disconnect();
-        streams_.clear();
+        this->clear_streams();
 
 reconnect:
         if(!running_) break;
@@ -285,7 +337,7 @@ reconnect:
 // ============================================================================
 
 int client::do_connect() {
-    ESP_LOGI(TAG, "Connecting to %s:%d...", host_.c_str(), port_);
+    ESP_LOGI(TAG, "Connecting to %s:%d...", host_, port_);
 
 #ifdef CONFIG_THINGER_IOTMP_TLS
     // Use esp_tls for TLS connections
@@ -301,15 +353,15 @@ int client::do_connect() {
         return -1;
     }
 
-    int ret = esp_tls_conn_new_sync(host_.c_str(), host_.size(), port_, &cfg, tls_);
+    int ret = esp_tls_conn_new_sync(host_, strlen(host_), port_, &cfg, tls_);
     if(ret != 1) {
-        ESP_LOGE(TAG, "TLS connection failed to %s:%d", host_.c_str(), port_);
+        ESP_LOGE(TAG, "TLS connection failed to %s:%d", host_, port_);
         esp_tls_conn_destroy(tls_);
         tls_ = nullptr;
         return -1;
     }
 
-    ESP_LOGI(TAG, "Connected to %s:%d (TLS)", host_.c_str(), port_);
+    ESP_LOGI(TAG, "Connected to %s:%d (TLS)", host_, port_);
 #else
     // Plain TCP using BSD sockets
     struct addrinfo hints = {};
@@ -320,9 +372,9 @@ int client::do_connect() {
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port_);
 
-    int rc = getaddrinfo(host_.c_str(), port_str, &hints, &res);
+    int rc = getaddrinfo(host_, port_str, &hints, &res);
     if(rc != 0 || !res) {
-        ESP_LOGE(TAG, "DNS resolve failed for %s: %d", host_.c_str(), rc);
+        ESP_LOGE(TAG, "DNS resolve failed for %s: %d", host_, rc);
         return -1;
     }
 
@@ -351,7 +403,7 @@ int client::do_connect() {
         return -errno;
     }
 
-    ESP_LOGI(TAG, "Connected to %s:%d (TCP)", host_.c_str(), port_);
+    ESP_LOGI(TAG, "Connected to %s:%d (TCP)", host_, port_);
 #endif
 
     return 0;
@@ -373,142 +425,8 @@ void client::do_disconnect() {
 }
 
 // ============================================================================
-// Authentication
+// TX queue (for cross-task message sending)
 // ============================================================================
-
-bool client::do_authenticate() {
-    // IMPORTANT: Credentials are sent in PAYLOAD as array [username, device_id, credential]
-    iotmp_message connect_msg(message::type::CONNECT);
-    connect_msg.set_random_stream_id();
-    connect_msg[message::field::PAYLOAD] = json_t::array({username_, device_id_, credentials_});
-
-    if(!write_message(connect_msg)) {
-        ESP_LOGE(TAG, "Failed to send CONNECT");
-        return false;
-    }
-
-    iotmp_message response(message::type::RESERVED);
-    if(!read_message(response)) {
-        ESP_LOGE(TAG, "No CONNECT response");
-        return false;
-    }
-
-    return response.get_message_type() == message::type::OK;
-}
-
-// ============================================================================
-// Socket I/O
-// ============================================================================
-
-bool client::socket_read(void* buf, size_t len) {
-    auto* ptr = static_cast<uint8_t*>(buf);
-    size_t remaining = len;
-
-    while(remaining > 0) {
-#ifdef CONFIG_THINGER_IOTMP_TLS
-        if(!tls_) return false;
-        ssize_t rc = esp_tls_conn_read(tls_, ptr, remaining);
-        if(rc < 0) {
-            if(rc == ESP_TLS_ERR_SSL_WANT_READ || rc == ESP_TLS_ERR_SSL_WANT_WRITE) {
-                continue; // Retry on TLS want read/write
-            }
-            return false;
-        }
-        if(rc == 0) return false; // Connection closed
-#else
-        ssize_t rc = recv(sock_, ptr, remaining, 0);
-        if(rc <= 0) return false;
-#endif
-        ptr += rc;
-        remaining -= rc;
-    }
-    return true;
-}
-
-bool client::socket_write(const void* buf, size_t len) {
-    auto* ptr = static_cast<const uint8_t*>(buf);
-    size_t remaining = len;
-
-    while(remaining > 0) {
-#ifdef CONFIG_THINGER_IOTMP_TLS
-        if(!tls_) return false;
-        ssize_t rc = esp_tls_conn_write(tls_, ptr, remaining);
-        if(rc < 0) {
-            if(rc == ESP_TLS_ERR_SSL_WANT_READ || rc == ESP_TLS_ERR_SSL_WANT_WRITE) {
-                continue; // Retry on TLS want read/write
-            }
-            return false;
-        }
-        if(rc == 0) return false;
-#else
-        ssize_t rc = send(sock_, ptr, remaining, 0);
-        if(rc <= 0) return false;
-#endif
-        ptr += rc;
-        remaining -= rc;
-    }
-    return true;
-}
-
-bool client::read_varint(uint32_t& value) {
-    value = 0;
-    uint8_t byte;
-    uint8_t bit_pos = 0;
-
-    do {
-        if(!socket_read(&byte, 1) || bit_pos >= 32) return false;
-        value |= static_cast<uint32_t>(byte & 0x7F) << bit_pos;
-        bit_pos += 7;
-    } while(byte & 0x80);
-
-    return true;
-}
-
-// ============================================================================
-// Message I/O
-// ============================================================================
-
-bool client::read_message(iotmp_message& msg) {
-    // Read message type (1 byte varint)
-    uint32_t type_val;
-    if(!read_varint(type_val)) return false;
-
-    // Read body size
-    uint32_t body_size;
-    if(!read_varint(body_size)) return false;
-
-    msg.set_message_type(static_cast<message::type>(type_val));
-
-    if(body_size == 0) return true;
-
-    if(body_size > CONFIG_THINGER_IOTMP_MAX_MESSAGE_SIZE) {
-        ESP_LOGE(TAG, "Message too large: %u bytes", (unsigned)body_size);
-        return false;
-    }
-
-    // Read body
-    if(!socket_read(read_buffer_, body_size)) return false;
-
-    // Decode fields
-    memory_reader reader(read_buffer_, body_size);
-    iotmp_decoder<memory_reader> decoder(reader);
-    return decoder.decode(msg, body_size);
-}
-
-bool client::write_message(iotmp_message& msg) {
-    auto encoded = encode_message(msg);
-    return socket_write(encoded.data(), encoded.size());
-}
-
-void client::send_message(iotmp_message& msg) {
-    if(!connected_) return;
-
-    if(msg.get_message_type() != message::STREAM_DATA) {
-        ESP_LOGD(TAG, "TX: %s (stream=%u)", msg.message_type_str(), msg.get_stream_id());
-    }
-
-    write_message(msg);
-}
 
 bool client::enqueue_message(iotmp_message& msg) {
     auto encoded = encode_message(msg);
@@ -528,191 +446,10 @@ void client::flush_tx_queue() {
     xSemaphoreTake(tx_mutex_, portMAX_DELAY);
     while(!tx_queue_.empty()) {
         auto& data = tx_queue_.front();
-        socket_write(data.data(), data.size());
+        send_bytes(data.data(), data.size());
         tx_queue_.pop();
     }
     xSemaphoreGive(tx_mutex_);
-}
-
-// ============================================================================
-// Message handling
-// ============================================================================
-
-void client::handle_message(iotmp_message& msg) {
-    if(msg.get_message_type() != message::STREAM_DATA) {
-        ESP_LOGD(TAG, "RX: %s (stream=%u)", msg.message_type_str(), msg.get_stream_id());
-    }
-
-    switch(msg.get_message_type()) {
-        case message::KEEP_ALIVE:
-            ESP_LOGD(TAG, "Keep-alive received");
-            break;
-
-        case message::RUN:
-        case message::DESCRIBE:
-        case message::START_STREAM:
-        case message::STOP_STREAM:
-        case message::STREAM_DATA:
-            handle_resource_request(msg);
-            break;
-
-        default:
-            ESP_LOGW(TAG, "Unhandled message type: %d", static_cast<int>(msg.get_message_type()));
-            break;
-    }
-}
-
-void client::handle_resource_request(iotmp_message& request) {
-    iotmp_resource* resource = nullptr;
-
-    auto msg_type = request.get_message_type();
-
-    // For stream data and stop, look up by stream ID
-    if(msg_type == message::STREAM_DATA || msg_type == message::STOP_STREAM) {
-        auto it = streams_.find(request.get_stream_id());
-        if(it != streams_.end()) {
-            resource = it->second.resource;
-        }
-    }
-
-    // Look up by resource path
-    if(!resource && request.has_field(message::field::RESOURCE)) {
-        const auto& res = request[message::field::RESOURCE];
-        if(res.is_string()) {
-            resource = find_resource(res.get<std::string>());
-        }
-    }
-
-    if(!resource) {
-        // Handle DESCRIBE without resource (API listing)
-        if(msg_type == message::DESCRIBE && !request.has_field(message::field::RESOURCE)) {
-            iotmp_message response(request.get_stream_id(), message::type::OK);
-            for(auto& [path, res] : resources_) {
-                res.fill_api(response[message::field::PAYLOAD][path.c_str()]);
-            }
-            send_message(response);
-            return;
-        }
-
-        if(msg_type != message::STREAM_DATA) {
-            iotmp_message error(request.get_stream_id(), message::type::ERROR);
-            send_message(error);
-        }
-        return;
-    }
-
-    switch(msg_type) {
-        case message::RUN: {
-            iotmp_message response(request.get_stream_id(), message::type::OK);
-            bool success = resource->run_resource(request, response);
-            response.set_message_type(success ? message::type::OK : message::type::ERROR);
-            send_message(response);
-
-            // If input was received and stream is active, echo current state
-            if(request.has_payload() && resource->stream_enabled() && resource->stream_echo() &&
-               (resource->get_io_type() == iotmp_resource::input_wrapper ||
-                resource->get_io_type() == iotmp_resource::input_output_wrapper)) {
-                stream_resource(*resource, resource->get_stream_id());
-            }
-            break;
-        }
-
-        case message::DESCRIBE: {
-            iotmp_message response(request.get_stream_id(), message::type::OK);
-            resource->describe(response);
-            send_message(response);
-            break;
-        }
-
-        case message::START_STREAM: {
-            uint16_t stream_id = request.get_stream_id();
-            auto& cfg = streams_[stream_id];
-            cfg.resource = resource;
-
-            // Check for interval parameter
-            if(request.has_params()) {
-                const auto& params = request.params();
-                if(params.contains("interval")) {
-                    cfg.interval_ms = params["interval"].get<uint32_t>();
-                }
-            }
-
-            if(cfg.interval_ms == 0) {
-                resource->set_stream_id(stream_id);
-            }
-
-            iotmp_message response(stream_id, message::type::OK);
-            send_message(response);
-
-            if(resource->stream_echo()) {
-                stream_resource(*resource, stream_id);
-            }
-            break;
-        }
-
-        case message::STOP_STREAM: {
-            uint16_t stream_id = request.get_stream_id();
-            if(resource->get_stream_id() == stream_id) {
-                resource->set_stream_id(0);
-            }
-            streams_.erase(stream_id);
-
-            iotmp_message response(stream_id, message::type::OK);
-            send_message(response);
-            break;
-        }
-
-        case message::STREAM_DATA: {
-            iotmp_message response(request.get_stream_id(), message::type::STREAM_DATA);
-            resource->run_resource(request, response);
-
-            if(resource->stream_echo() &&
-               (resource->get_io_type() == iotmp_resource::input_wrapper ||
-                resource->get_io_type() == iotmp_resource::input_output_wrapper)) {
-                stream_resource(*resource, request.get_stream_id());
-            }
-            break;
-        }
-
-        default:
-            break;
-    }
-}
-
-// ============================================================================
-// Streaming
-// ============================================================================
-
-bool client::stream_resource(iotmp_resource& resource, uint16_t stream_id) {
-    iotmp_message request(message::type::STREAM_DATA);
-    iotmp_message response(message::type::STREAM_DATA);
-    resource.run_resource(request, response);
-
-    auto& msg = response.has_field(message::field::PAYLOAD) ? response : request;
-    if(msg.has_field(message::field::PAYLOAD)) {
-        msg.set_stream_id(stream_id);
-        send_message(msg);
-        return true;
-    }
-    return false;
-}
-
-void client::check_stream_intervals() {
-    int64_t now = uptime_ms();
-    for(auto& [stream_id, cfg] : streams_) {
-        if(cfg.interval_ms > 0 && cfg.resource) {
-            if(now - cfg.last_streaming >= cfg.interval_ms) {
-                cfg.last_streaming = now;
-                stream_resource(*cfg.resource, stream_id);
-            }
-        }
-    }
-}
-
-bool client::stream(const char* resource_name) {
-    auto it = resources_.find(resource_name);
-    if(it == resources_.end() || !it->second.stream_enabled()) return false;
-    return stream_resource(it->second, it->second.get_stream_id());
 }
 
 // ============================================================================
@@ -731,7 +468,7 @@ bool client::server_request(iotmp_message& msg, json_t* response_payload) {
     iotmp_message response(message::type::RESERVED);
     int attempts = 0;
     while(connected_ && attempts < 100) {
-        if(read_message(response)) {
+        if(this->read_message(response)) {
             if(response.get_stream_id() == expected_stream_id &&
                response.get_message_type() <= message::type::ERROR) {
                 if(response_payload && response.has_payload()) {
@@ -740,7 +477,7 @@ bool client::server_request(iotmp_message& msg, json_t* response_payload) {
                 return response.get_message_type() == message::type::OK;
             }
             // Not our response -- handle it normally
-            handle_message(response);
+            this->handle_message(response);
         }
         attempts++;
     }
@@ -788,12 +525,6 @@ bool client::call_endpoint(const char* endpoint_name, json_t data) {
 // ============================================================================
 // Helpers
 // ============================================================================
-
-iotmp_resource* client::find_resource(const std::string& path) {
-    auto it = resources_.find(path);
-    if(it != resources_.end()) return &it->second;
-    return nullptr;
-}
 
 void client::notify_state(client_state state) {
     state_ = state;
