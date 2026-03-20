@@ -70,10 +70,20 @@
 
 #include <string>
 #include <queue>
-#include <functional>
 
 namespace thinger::iotmp {
 
+    // ----------------------------------------------------------------
+    // ESP-IDF IOTMP client.
+    //
+    // Inherits all protocol and connection-lifecycle logic from
+    // iotmp_client_base via CRTP.  This class only provides transport
+    // primitives, FreeRTOS task management, and a cross-task TX queue.
+    //
+    // Call start() to spawn the client task — it calls handle()
+    // in a loop, which manages connection, authentication, keepalive,
+    // streams, and reconnection automatically.
+    // ----------------------------------------------------------------
     class client : public iotmp_client_base<client> {
     public:
         client();
@@ -83,26 +93,17 @@ namespace thinger::iotmp {
         esp_err_t start();
         void stop();
 
-        // State
-        bool is_connected() const { return connected_; }
-        client_state get_state() const { return state_; }
-
-        // Server API (thread-safe — call from any task)
-        bool set_property(const char* property_id, json_t data);
-        bool get_property(const char* property_id, json_t& data);
-        bool write_bucket(const char* bucket_id, json_t data);
-        bool call_endpoint(const char* endpoint_name);
-        bool call_endpoint(const char* endpoint_name, json_t data);
-
         // ----- CRTP transport implementation -------------------------
 
         bool send_bytes_impl(const void* data, size_t len);
         bool recv_bytes_impl(void* buf, size_t len);
         bool is_connected_impl() const;
+        bool connect_impl();
+        void disconnect_impl();
+        bool data_available_impl();
         unsigned long get_millis() const;
-        void on_disconnect();
 
-        // Send message from any task (queues + wakes select)
+        // Send message from any task (queues + notifies)
         bool enqueue_message(iotmp_message& msg);
 
     private:
@@ -112,18 +113,11 @@ namespace thinger::iotmp {
         // Main loop (runs in client task)
         void run();
 
-        // Connection lifecycle
-        int do_connect();
-        void do_disconnect();
-
         // Flush TX queue (called from client task)
         void flush_tx_queue();
 
-        // Server API helper (sends RUN message and waits for response)
-        bool server_request(iotmp_message& msg, json_t* response_payload = nullptr);
-
-        // State management (also notifies via base class callback)
-        void set_state(client_state state);
+        // Get the underlying socket fd (works for both TLS and plain)
+        int get_socket_fd() const;
 
         // Socket (plain TCP)
         int sock_ = -1;
@@ -136,15 +130,10 @@ namespace thinger::iotmp {
         // Task
         TaskHandle_t task_handle_ = nullptr;
         volatile bool running_ = false;
-        volatile bool connected_ = false;
-        client_state state_ = client_state::DISCONNECTED;
 
         // TX queue (for cross-task message sending)
         SemaphoreHandle_t tx_mutex_ = nullptr;
         std::queue<std::string> tx_queue_;
-
-        // Read buffer
-        uint8_t read_buffer_[CONFIG_THINGER_IOTMP_MAX_MESSAGE_SIZE];
     };
 
 }
