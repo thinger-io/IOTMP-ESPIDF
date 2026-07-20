@@ -69,7 +69,6 @@
 #endif
 
 #include <string>
-#include <queue>
 
 namespace thinger::iotmp {
 
@@ -103,8 +102,14 @@ namespace thinger::iotmp {
         bool data_available_impl();
         unsigned long get_millis() const;
 
-        // Send message from any task (queues + notifies)
-        bool enqueue_message(iotmp_message& msg);
+        // ----- I/O serialization (thread-safety) ---------------------
+        // Overrides the base no-op hooks. All socket reads/writes — from
+        // the client task and from device-initiated API calls made in
+        // other tasks (write_bucket, stream, set_property...) — are
+        // serialized through a recursive mutex, so frames never interleave
+        // and RPC responses are never stolen by the wrong task.
+        void io_lock();
+        void io_unlock();
 
     private:
         // Task entry point
@@ -112,9 +117,6 @@ namespace thinger::iotmp {
 
         // Main loop (runs in client task)
         void run();
-
-        // Flush TX queue (called from client task)
-        void flush_tx_queue();
 
         // Get the underlying socket fd (works for both TLS and plain)
         int get_socket_fd() const;
@@ -131,9 +133,8 @@ namespace thinger::iotmp {
         TaskHandle_t task_handle_ = nullptr;
         volatile bool running_ = false;
 
-        // TX queue (for cross-task message sending)
-        SemaphoreHandle_t tx_mutex_ = nullptr;
-        std::queue<std::string> tx_queue_;
+        // Recursive mutex serializing all socket access across tasks
+        SemaphoreHandle_t io_mutex_ = nullptr;
     };
 
 }

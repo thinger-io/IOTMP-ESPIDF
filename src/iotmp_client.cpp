@@ -25,7 +25,9 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#if defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
 #include "esp_crt_bundle.h"
+#endif
 
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
@@ -42,7 +44,9 @@ namespace thinger::iotmp {
 // ============================================================================
 
 client::client() {
-    tx_mutex_ = xSemaphoreCreateMutex();
+    // Recursive: higher-level operations (send_and_wait_response) hold the
+    // lock while calling read_message/write_message, which re-acquire it.
+    io_mutex_ = xSemaphoreCreateRecursiveMutex();
     // Default port depends on TLS config
 #ifdef CONFIG_THINGER_IOTMP_TLS
     port_ = 25206;
@@ -53,10 +57,22 @@ client::client() {
 
 client::~client() {
     stop();
-    if(tx_mutex_) {
-        vSemaphoreDelete(tx_mutex_);
-        tx_mutex_ = nullptr;
+    if(io_mutex_) {
+        vSemaphoreDelete(io_mutex_);
+        io_mutex_ = nullptr;
     }
+}
+
+// ============================================================================
+// I/O serialization (thread-safety)
+// ============================================================================
+
+void client::io_lock() {
+    xSemaphoreTakeRecursive(io_mutex_, portMAX_DELAY);
+}
+
+void client::io_unlock() {
+    xSemaphoreGiveRecursive(io_mutex_);
 }
 
 // ============================================================================
@@ -136,7 +152,9 @@ bool client::connect_impl() {
     cfg.timeout_ms = 10000;
     cfg.non_block = false;
     // Use system certificate bundle if available
+#if defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
+#endif
 
     tls_ = esp_tls_init();
     if(!tls_) {
@@ -232,9 +250,6 @@ bool client::data_available_impl() {
     struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 }; // 100ms
     int rc = select(fd + 1, &read_fds, nullptr, nullptr, &tv);
 
-    // Also flush TX queue on each poll cycle
-    flush_tx_queue();
-
 #ifdef CONFIG_THINGER_IOTMP_TLS
     // TLS may have buffered data even if select() says no
     if(tls_ && esp_tls_get_bytes_avail(tls_) > 0) {
@@ -312,34 +327,6 @@ void client::run() {
     while(running_) {
         this->handle();
     }
-}
-
-// ============================================================================
-// TX queue (for cross-task message sending)
-// ============================================================================
-
-bool client::enqueue_message(iotmp_message& msg) {
-    auto encoded = encode_message(msg);
-
-    xSemaphoreTake(tx_mutex_, portMAX_DELAY);
-    tx_queue_.push(std::move(encoded));
-    xSemaphoreGive(tx_mutex_);
-
-    // Notify the client task so it picks up queued data promptly
-    if(task_handle_) {
-        xTaskNotifyGive(task_handle_);
-    }
-    return true;
-}
-
-void client::flush_tx_queue() {
-    xSemaphoreTake(tx_mutex_, portMAX_DELAY);
-    while(!tx_queue_.empty()) {
-        auto& data = tx_queue_.front();
-        send_bytes(data.data(), data.size());
-        tx_queue_.pop();
-    }
-    xSemaphoreGive(tx_mutex_);
 }
 
 } // namespace thinger::iotmp
